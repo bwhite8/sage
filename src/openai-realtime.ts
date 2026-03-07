@@ -12,7 +12,8 @@ CRITICAL BEHAVIOR RULES:
 - If asked to look something up, use the web search tool to find current information.
 - When you need to search, briefly say something like "Let me look that up" before searching.
 - After getting search results, summarize the key findings conversationally.
-- If you're unsure whether someone was talking to you, stay silent. Err on the side of not responding.`;
+- If you're unsure whether someone was talking to you, stay silent. Err on the side of not responding.
+- Always speak in English unless explicitly asked to speak in another language.`;
 
 const WEB_SEARCH_TOOL = {
   type: 'function',
@@ -35,6 +36,7 @@ export class OpenAIRealtimeSession {
   private apiKey: string;
 
   onAudioResponse: ((base64Audio: string) => void) | null = null;
+  onClose: (() => void) | null = null;
 
   constructor(apiKey: string) {
     this.apiKey = apiKey;
@@ -62,6 +64,9 @@ export class OpenAIRealtimeSession {
 
       this.ws.on('close', () => {
         console.log('[OpenAI] WebSocket closed');
+        if (this.onClose) {
+          this.onClose();
+        }
       });
 
       this.ws.on('error', (err) => {
@@ -121,13 +126,20 @@ export class OpenAIRealtimeSession {
   private async handleFunctionCall(msg: Record<string, unknown>): Promise<void> {
     const name = msg.name as string;
     const callId = msg.call_id as string;
-    const args = JSON.parse(msg.arguments as string);
+    let args: Record<string, unknown>;
+    try {
+      args = JSON.parse(msg.arguments as string);
+    } catch (err) {
+      console.error('[OpenAI] Failed to parse function call arguments:', msg.arguments, err);
+      this.sendFunctionResult(callId, 'Sorry, there was an error processing the request.');
+      return;
+    }
 
     console.log(`[OpenAI] Function call: ${name}`, args);
 
     if (name === 'web_search') {
       try {
-        const result = await this.executeWebSearch(args.query);
+        const result = await this.executeWebSearch(args.query as string);
         this.sendFunctionResult(callId, result);
       } catch (err) {
         console.error('[OpenAI] Web search failed:', err);

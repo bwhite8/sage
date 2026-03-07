@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import crypto from 'crypto';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { TwilioStream } from './twilio-stream';
@@ -16,8 +17,49 @@ app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok' });
 });
 
+function validateTwilioSignature(req: express.Request): boolean {
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!authToken) {
+    console.warn('[Server] TWILIO_AUTH_TOKEN not set, skipping signature validation');
+    return true;
+  }
+
+  const signature = req.headers['x-twilio-signature'] as string;
+  if (!signature) return false;
+
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+  const url = `${protocol}://${req.headers.host}${req.originalUrl}`;
+
+  // Build the data string: URL + sorted POST param key-value pairs
+  const params = req.body as Record<string, string>;
+  const sortedKeys = Object.keys(params).sort();
+  const data = sortedKeys.reduce((acc, key) => acc + key + params[key], url);
+
+  const expectedSignature = crypto
+    .createHmac('sha1', authToken)
+    .update(data)
+    .digest('base64');
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature),
+  );
+}
+
 app.post('/incoming-call', (req, res) => {
+  if (!validateTwilioSignature(req)) {
+    console.warn('[Server] Invalid Twilio signature, rejecting request');
+    res.status(403).send('Forbidden');
+    return;
+  }
+
   const host = req.headers.host;
+  if (!host || !/^[\w.-]+(:\d+)?$/.test(host)) {
+    console.warn('[Server] Invalid Host header:', host);
+    res.status(400).send('Bad Request');
+    return;
+  }
+
   res.set('Content-Type', 'text/xml');
   res.send(`
     <Response>
@@ -56,12 +98,7 @@ wss.on('connection', async (ws: WebSocket) => {
   const twilioStream = new TwilioStream(ws);
   const openaiSession = new OpenAIRealtimeSession(apiKey);
 
-  // Wire audio: Twilio -> OpenAI
-  twilioStream.onAudioReceived = (base64Audio) => {
-    openaiSession.sendAudio(base64Audio);
-  };
-
-  // Wire audio: OpenAI -> Twilio
+  // Wire audio: OpenAI -> Twilio (safe to set before connect)
   openaiSession.onAudioResponse = (base64Audio) => {
     twilioStream.sendAudio(base64Audio);
   };
@@ -72,8 +109,20 @@ wss.on('connection', async (ws: WebSocket) => {
     openaiSession.close();
   });
 
+  // Clean up on OpenAI disconnect
+  openaiSession.onClose = () => {
+    console.log('[Server] OpenAI session closed, closing Twilio stream');
+    twilioStream.close();
+  };
+
   try {
     await openaiSession.connect();
+
+    // Wire audio: Twilio -> OpenAI (only after OpenAI is connected)
+    twilioStream.onAudioReceived = (base64Audio) => {
+      openaiSession.sendAudio(base64Audio);
+    };
+
     console.log('[Server] Bridge established: Twilio <-> OpenAI');
   } catch (err) {
     console.error('[Server] Failed to connect to OpenAI:', err);
