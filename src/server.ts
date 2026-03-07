@@ -5,6 +5,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { TwilioStream } from './twilio-stream';
 import { OpenAIRealtimeSession } from './openai-realtime';
+import { DashboardEvent } from './types';
 
 const app = express();
 const server = createServer(app);
@@ -72,13 +73,43 @@ app.post('/incoming-call', (req, res) => {
 });
 
 const wss = new WebSocketServer({ noServer: true });
+const dashboardWss = new WebSocketServer({ noServer: true });
+const dashboardClients = new Set<WebSocket>();
+
+function broadcastDashboard(event: DashboardEvent): void {
+  const data = JSON.stringify(event);
+  for (const client of dashboardClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(data);
+    }
+  }
+}
 
 server.on('upgrade', (request, socket, head) => {
-  const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
+  const url = new URL(request.url || '', `http://${request.headers.host}`);
+  const pathname = url.pathname;
 
   if (pathname === '/media-stream') {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
+    });
+  } else if (pathname === '/dashboard') {
+    const dashboardToken = process.env.DASHBOARD_TOKEN;
+    if (dashboardToken) {
+      const token = url.searchParams.get('token');
+      if (token !== dashboardToken) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+    dashboardWss.handleUpgrade(request, socket, head, (ws) => {
+      dashboardClients.add(ws);
+      console.log(`[Dashboard] Client connected (${dashboardClients.size} total)`);
+      ws.on('close', () => {
+        dashboardClients.delete(ws);
+        console.log(`[Dashboard] Client disconnected (${dashboardClients.size} total)`);
+      });
     });
   } else {
     socket.destroy();
@@ -103,9 +134,33 @@ wss.on('connection', async (ws: WebSocket) => {
     twilioStream.sendAudio(base64Audio);
   };
 
+  // Wire dashboard events
+  broadcastDashboard({ type: 'call.started' });
+
+  openaiSession.onUserTranscript = (text) => {
+    broadcastDashboard({ type: 'transcript.user', text, timestamp: Date.now() });
+  };
+  openaiSession.onSageTranscriptDelta = (text) => {
+    broadcastDashboard({ type: 'transcript.sage.delta', text, timestamp: Date.now() });
+  };
+  openaiSession.onSageTranscriptDone = (text) => {
+    broadcastDashboard({ type: 'transcript.sage', text, timestamp: Date.now() });
+  };
+  openaiSession.onToolCallStarted = (name, args) => {
+    broadcastDashboard({ type: 'tool_call.started', name, args, timestamp: Date.now() });
+  };
+  openaiSession.onToolCallCompleted = (name, result) => {
+    broadcastDashboard({ type: 'tool_call.completed', name, result, timestamp: Date.now() });
+  };
+  openaiSession.onStatusChange = (status) => {
+    broadcastDashboard({ type: 'status', status });
+  };
+
   // Clean up on Twilio disconnect
   ws.on('close', () => {
     console.log('[Server] Twilio stream disconnected, closing OpenAI session');
+    broadcastDashboard({ type: 'call.ended' });
+    broadcastDashboard({ type: 'status', status: 'idle' });
     openaiSession.close();
   });
 
