@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
+const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-realtime-1.5';
 
 const SYSTEM_PROMPT = `You are Sage, an AI assistant participating in a meeting via phone call. You can hear all participants in the meeting.
 
@@ -118,7 +118,7 @@ export class OpenAIRealtimeSession {
         voice: 'alloy',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        input_audio_transcription: { model: 'whisper-1' },
+        input_audio_transcription: { model: 'gpt-4o-mini-transcribe' },
         instructions: SYSTEM_PROMPT,
         tools: [WEB_SEARCH_TOOL, SEND_RECAP_EMAIL_TOOL],
         turn_detection: {
@@ -240,33 +240,28 @@ export class OpenAIRealtimeSession {
   private async executeWebSearch(query: string): Promise<string> {
     console.log(`[OpenAI] Executing web search: "${query}"`);
 
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        tools: [{ type: 'web_search_preview' }],
-        messages: [
-          {
-            role: 'user',
-            content: query,
-          },
-        ],
+        model: 'gpt-5.3-chat-latest',
+        tools: [{ type: 'web_search' }],
+        input: query,
       }),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Chat Completions API error: ${response.status} ${errorText}`);
+      throw new Error(`Responses API error: ${response.status} ${errorText}`);
     }
 
     const data = await response.json() as {
-      choices: Array<{ message: { content: string | null } }>;
+      output_text: string | null;
     };
-    const content = data.choices?.[0]?.message?.content;
+    const content = data.output_text;
     return content || 'No results found.';
   }
 
