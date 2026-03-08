@@ -5,7 +5,9 @@ export class TwilioStream {
   private ws: WebSocket;
   private streamSid: string | null = null;
 
+  callSid: string | null = null;
   onAudioReceived: ((base64Audio: string) => void) | null = null;
+  onStart: ((callSid: string) => void) | null = null;
 
   constructor(ws: WebSocket) {
     this.ws = ws;
@@ -20,7 +22,9 @@ export class TwilioStream {
 
         case 'start':
           this.streamSid = msg.start!.streamSid;
-          console.log(`[Twilio] Stream started: ${this.streamSid}`);
+          this.callSid = msg.start!.callSid;
+          console.log(`[Twilio] Stream started: ${this.streamSid}, callSid: ${this.callSid}`);
+          this.onStart?.(this.callSid);
           break;
 
         case 'media':

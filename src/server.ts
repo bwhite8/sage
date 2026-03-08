@@ -5,7 +5,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { TwilioStream } from './twilio-stream';
 import { OpenAIRealtimeSession } from './openai-realtime';
-import { DashboardEvent } from './types';
+import { CallScopedEvent, DashboardClientMessage } from './types';
 
 const app = express();
 const server = createServer(app);
@@ -74,12 +74,26 @@ app.post('/incoming-call', (req, res) => {
 
 const wss = new WebSocketServer({ noServer: true });
 const dashboardWss = new WebSocketServer({ noServer: true });
-const dashboardClients = new Set<WebSocket>();
+const dashboardClients = new Map<WebSocket, string | null>();
+const activeCalls = new Map<string, { startedAt: number }>();
 
-function broadcastDashboard(event: DashboardEvent): void {
-  const data = JSON.stringify(event);
-  for (const client of dashboardClients) {
-    if (client.readyState === WebSocket.OPEN) {
+function broadcastDashboard(callId: string, event: CallScopedEvent): void {
+  const data = JSON.stringify({ ...event, callId });
+  for (const [client, subscribedCallId] of dashboardClients) {
+    if (client.readyState === WebSocket.OPEN && subscribedCallId === callId) {
+      client.send(data);
+    }
+  }
+}
+
+function broadcastActiveCallsList(): void {
+  const calls = Array.from(activeCalls.entries()).map(([callId, info]) => ({
+    callId,
+    startedAt: info.startedAt,
+  }));
+  const data = JSON.stringify({ type: 'calls.active', calls });
+  for (const [client, subscribedCallId] of dashboardClients) {
+    if (client.readyState === WebSocket.OPEN && subscribedCallId === null) {
       client.send(data);
     }
   }
@@ -104,8 +118,43 @@ server.on('upgrade', (request, socket, head) => {
       }
     }
     dashboardWss.handleUpgrade(request, socket, head, (ws) => {
-      dashboardClients.add(ws);
+      dashboardClients.set(ws, null);
       console.log(`[Dashboard] Client connected (${dashboardClients.size} total)`);
+
+      ws.on('message', (raw) => {
+        try {
+          const message = JSON.parse(String(raw)) as DashboardClientMessage;
+
+          switch (message.type) {
+            case 'get.active_calls': {
+              const calls = Array.from(activeCalls.entries()).map(([callId, info]) => ({
+                callId,
+                startedAt: info.startedAt,
+              }));
+              ws.send(JSON.stringify({ type: 'calls.active', calls }));
+              break;
+            }
+            case 'subscribe': {
+              dashboardClients.set(ws, message.callId);
+              console.log(`[Dashboard] Client subscribed to call ${message.callId}`);
+              // Send call.started so the client knows the call is active
+              if (activeCalls.has(message.callId)) {
+                ws.send(JSON.stringify({ type: 'call.started', callId: message.callId }));
+              }
+              break;
+            }
+            case 'unsubscribe': {
+              const prev = dashboardClients.get(ws);
+              dashboardClients.set(ws, null);
+              console.log(`[Dashboard] Client unsubscribed from call ${prev}`);
+              break;
+            }
+          }
+        } catch {
+          console.warn('[Dashboard] Failed to parse client message');
+        }
+      });
+
       ws.on('close', () => {
         dashboardClients.delete(ws);
         console.log(`[Dashboard] Client disconnected (${dashboardClients.size} total)`);
@@ -134,33 +183,44 @@ wss.on('connection', async (ws: WebSocket) => {
     twilioStream.sendAudio(base64Audio);
   };
 
-  // Wire dashboard events
-  broadcastDashboard({ type: 'call.started' });
+  // Wait for Twilio start message to get callSid, then wire dashboard events
+  twilioStream.onStart = (callSid) => {
+    console.log(`[Server] Call started: ${callSid}`);
+    activeCalls.set(callSid, { startedAt: Date.now() });
+    broadcastActiveCallsList();
 
-  openaiSession.onUserTranscript = (text) => {
-    broadcastDashboard({ type: 'transcript.user', text, timestamp: Date.now() });
-  };
-  openaiSession.onSageTranscriptDelta = (text) => {
-    broadcastDashboard({ type: 'transcript.sage.delta', text, timestamp: Date.now() });
-  };
-  openaiSession.onSageTranscriptDone = (text) => {
-    broadcastDashboard({ type: 'transcript.sage', text, timestamp: Date.now() });
-  };
-  openaiSession.onToolCallStarted = (name, args) => {
-    broadcastDashboard({ type: 'tool_call.started', name, args, timestamp: Date.now() });
-  };
-  openaiSession.onToolCallCompleted = (name, result) => {
-    broadcastDashboard({ type: 'tool_call.completed', name, result, timestamp: Date.now() });
-  };
-  openaiSession.onStatusChange = (status) => {
-    broadcastDashboard({ type: 'status', status });
+    broadcastDashboard(callSid, { type: 'call.started' });
+
+    openaiSession.onUserTranscript = (text) => {
+      broadcastDashboard(callSid, { type: 'transcript.user', text, timestamp: Date.now() });
+    };
+    openaiSession.onSageTranscriptDelta = (text) => {
+      broadcastDashboard(callSid, { type: 'transcript.sage.delta', text, timestamp: Date.now() });
+    };
+    openaiSession.onSageTranscriptDone = (text) => {
+      broadcastDashboard(callSid, { type: 'transcript.sage', text, timestamp: Date.now() });
+    };
+    openaiSession.onToolCallStarted = (name, args) => {
+      broadcastDashboard(callSid, { type: 'tool_call.started', name, args, timestamp: Date.now() });
+    };
+    openaiSession.onToolCallCompleted = (name, result) => {
+      broadcastDashboard(callSid, { type: 'tool_call.completed', name, result, timestamp: Date.now() });
+    };
+    openaiSession.onStatusChange = (status) => {
+      broadcastDashboard(callSid, { type: 'status', status });
+    };
   };
 
   // Clean up on Twilio disconnect
   ws.on('close', () => {
-    console.log('[Server] Twilio stream disconnected, closing OpenAI session');
-    broadcastDashboard({ type: 'call.ended' });
-    broadcastDashboard({ type: 'status', status: 'idle' });
+    const callSid = twilioStream.callSid;
+    console.log(`[Server] Twilio stream disconnected (callSid: ${callSid}), closing OpenAI session`);
+    if (callSid) {
+      broadcastDashboard(callSid, { type: 'call.ended' });
+      broadcastDashboard(callSid, { type: 'status', status: 'idle' });
+      activeCalls.delete(callSid);
+      broadcastActiveCallsList();
+    }
     openaiSession.close();
   });
 
