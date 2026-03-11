@@ -115,7 +115,7 @@ export class OpenAIRealtimeSession {
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
-        voice: 'alloy',
+        voice: 'marin',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'gpt-4o-mini-transcribe' },
@@ -259,10 +259,16 @@ export class OpenAIRealtimeSession {
     }
 
     const data = await response.json() as {
-      output_text: string | null;
+      output: Array<{ type: string; content?: Array<{ type: string; text?: string }> }>;
     };
-    const content = data.output_text;
-    return content || 'No results found.';
+
+    const textParts = data.output
+      ?.filter((item) => item.type === 'message')
+      .flatMap((item) => item.content ?? [])
+      .filter((block) => block.type === 'output_text' && block.text)
+      .map((block) => block.text as string);
+
+    return textParts?.length ? textParts.join('\n') : 'No results found.';
   }
 
   private async sendRecapEmail(recipients: string[], subject: string, summary: string): Promise<string> {
