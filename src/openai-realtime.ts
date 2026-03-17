@@ -57,6 +57,17 @@ const WEB_SEARCH_TOOL = {
   },
 };
 
+const UNMUTE_TOOL = {
+  type: 'function',
+  name: 'unmute',
+  description: 'Send DTMF *6 to unmute Sage in the meeting (e.g. Teams, Zoom). Use when someone asks Sage to unmute or come off mute.',
+  parameters: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+};
+
 export class OpenAIRealtimeSession {
   private ws: WebSocket | null = null;
   private apiKey: string;
@@ -69,6 +80,7 @@ export class OpenAIRealtimeSession {
   onToolCallStarted: ((name: string, args: Record<string, unknown>) => void) | null = null;
   onToolCallCompleted: ((name: string, result: string) => void) | null = null;
   onStatusChange: ((status: 'listening' | 'thinking' | 'speaking') => void) | null = null;
+  onUnmuteRequested: (() => Promise<string>) | null = null;
 
   private hasEmittedSpeaking = false;
 
@@ -120,7 +132,7 @@ export class OpenAIRealtimeSession {
         output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'gpt-4o-mini-transcribe' },
         instructions: SYSTEM_PROMPT,
-        tools: [WEB_SEARCH_TOOL, SEND_RECAP_EMAIL_TOOL],
+        tools: [WEB_SEARCH_TOOL, SEND_RECAP_EMAIL_TOOL, UNMUTE_TOOL],
         turn_detection: {
           type: 'server_vad',
         },
@@ -212,6 +224,19 @@ export class OpenAIRealtimeSession {
       } catch (err) {
         console.error('[OpenAI] Web search failed:', err);
         const errorMsg = 'Sorry, the web search failed. Please try again.';
+        this.onToolCallCompleted?.(name, errorMsg);
+        this.sendFunctionResult(callId, errorMsg);
+      }
+    } else if (name === 'unmute') {
+      try {
+        const result = this.onUnmuteRequested
+          ? await this.onUnmuteRequested()
+          : 'Unmute not available';
+        this.onToolCallCompleted?.(name, result);
+        this.sendFunctionResult(callId, result);
+      } catch (err) {
+        console.error('[OpenAI] Unmute failed:', err);
+        const errorMsg = 'Sorry, the unmute failed.';
         this.onToolCallCompleted?.(name, errorMsg);
         this.sendFunctionResult(callId, errorMsg);
       }

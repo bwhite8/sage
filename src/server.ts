@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { TwilioStream } from './twilio-stream';
 import { OpenAIRealtimeSession } from './openai-realtime';
 import { CallScopedEvent, DashboardClientMessage } from './types';
+import { generateDtmfUlaw } from './dtmf';
 
 const app = express();
 const server = createServer(app);
@@ -165,8 +166,7 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-wss.on('connection', async (ws: WebSocket, request: import('http').IncomingMessage) => {
-  const wsHost = request.headers.host;
+wss.on('connection', async (ws: WebSocket) => {
   console.log('[Server] New media stream connection');
 
   const apiKey = process.env.OPENAI_API_KEY;
@@ -190,33 +190,13 @@ wss.on('connection', async (ws: WebSocket, request: import('http').IncomingMessa
     activeCalls.set(callSid, { startedAt: Date.now() });
     broadcastActiveCallsList();
 
-    // Send DTMF *6 to unmute in Teams after a short delay
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    if (accountSid && authToken) {
-      setTimeout(async () => {
-        try {
-          const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls/${callSid}.json`;
-          const resp = await fetch(url, {
-            method: 'POST',
-            headers: {
-              'Authorization': 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
-              'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body: new URLSearchParams({
-              Twiml: `<Response><Play digits="w*6"/><Connect><Stream url="wss://${wsHost}/media-stream"/></Connect></Response>`,
-            }),
-          });
-          if (resp.ok) {
-            console.log(`[Server] Sent DTMF *6 to unmute call ${callSid}`);
-          } else {
-            console.error(`[Server] Failed to send DTMF: ${resp.status} ${resp.statusText}`);
-          }
-        } catch (err) {
-          console.error('[Server] Error sending DTMF:', err);
-        }
-      }, 3000);
-    }
+    // Wire unmute tool — inject DTMF *6 as raw audio into the Twilio stream
+    openaiSession.onUnmuteRequested = async () => {
+      console.log(`[Server] Unmute requested for call ${callSid}`);
+      const dtmfAudio = generateDtmfUlaw('w*6');
+      twilioStream.sendAudio(dtmfAudio);
+      return 'DTMF *6 sent to unmute';
+    };
 
     broadcastDashboard(callSid, { type: 'call.started' });
 
